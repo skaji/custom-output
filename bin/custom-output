@@ -5,6 +5,7 @@ use utf8;
 use 5.008_005;
 use Config;
 use Getopt::Long qw(:config no_auto_abbrev no_ignore_case);
+use IO::Handle;
 use IO::Select;
 use IPC::Open3 'open3';
 use POSIX 'strftime';
@@ -46,6 +47,7 @@ my ($out, $err) = map gensym(), 1..2;
 my $log;
 if ($logfile) {
     open $log, ">>", $logfile or die "open $logfile: $!\n";
+    $log->autoflush(1);
 }
 
 my $pid;
