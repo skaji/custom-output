@@ -1,0 +1,124 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use utf8;
+use 5.008_005;
+use Config;
+use Getopt::Long qw(:config no_auto_abbrev no_ignore_case);
+use IO::Select;
+use IPC::Open3 'open3';
+use POSIX 'strftime';
+use Pod::Usage 'pod2usage';
+use Symbol 'gensym';
+use Sys::Hostname 'hostname';
+use constant CHUNK_SIZE => 64 * 1024;
+
+GetOptions
+    "logfile=s"       => \my $logfile,
+    "append-time"     => \my $append_time,
+    "append-hostname" => \my $append_hostname,
+    "append=s"        => \my @append,
+    "grep=s"          => \my $grep,
+    "help|h"          => sub { pod2usage(0) },
+or pod2usage(1);
+
+if ($grep) {
+    my $result = eval { qr{$grep} };
+    die "grep '$grep': $@\n" if $@;
+    $grep = $result;
+}
+
+my @cmd = @ARGV or do { warn "Missing exec command.\n"; pod2usage(1) };
+
+if ($append_hostname) {
+    unshift @append, hostname();
+}
+my $append = join '', map { "[$_]" } @append;
+my $format =
+       $append_time ? sub { "[@{[strftime('%F %T', localtime)]}]$append @_\n" }
+    :  $append      ? sub { "$append @_\n" }
+    :                 sub { "@_\n" }
+    ;
+
+
+my ($out, $err) = map gensym(), 1..2;
+
+my $log;
+if ($logfile) {
+    open $log, ">>", $logfile or die "open $logfile: $!\n";
+}
+
+my $pid;
+eval { $pid = open3 '<&' . fileno(STDIN), $out, $err, @cmd };
+die "exec '@cmd' failed: $!\n" unless $pid;
+
+my $select = IO::Select->new( $out, $err );
+
+$| = 1;
+
+while (my @ready = $select->can_read) {
+    for my $fh (@ready) {
+        my $len = sysread $fh, my $buf, CHUNK_SIZE;
+        if (!defined $len) {
+            my $type = $fh == $out ? "STDOUT" : "STDERR";
+            warn "sysread child's $type fialed: $!\n";
+            $select->remove($fh);
+            close $fh;
+            next;
+        } elsif ($len == 0) {
+            $select->remove($fh);
+            close $fh;
+            next;
+        } else {
+            my ($prefix, $output_fh) = $fh == $out ? ("out:", \*STDOUT) : ("err:", \*STDERR);
+            for my $line (split /\r?\n/, $buf) {
+                print {$log} $format->($prefix, $line) if $log;
+                print {$output_fh} $format->($line) if !$grep || $line =~ $grep;
+            }
+        }
+    }
+}
+close $log if $log;
+
+waitpid $pid, 0;
+my $child_error = $?;
+
+if ($child_error == -1) { # XXX
+    die "exec '@cmd' failed: $!\n";
+} elsif ($child_error & 127) {
+    my @signal = split /\s+/, $Config{sig_name};
+    die sprintf "child '@cmd' died with signal %s, %s coredump\n",
+        $signal[ $child_error & 127 ], ($child_error & 128) ? 'with' : 'without';
+} else {
+    exit($child_error >> 8);
+}
+
+__END__
+
+=head1 NAME
+
+custom-output - exec command with custom output
+
+=head1 SYNOPSIS
+
+    > costom-output [OPTIONS] -- COMMAND
+
+    Options:
+    --logfile FILENAME       print COMMAND's output to FILENAME too
+    --append-time            append time to each output line
+    --append-hostname        append hostname to each output line
+    --append STRING          append STRING to each output line,
+                             you can specify multiple append options
+    --grep REGEXP            restrict STDOUT/STDERR output that matches REGEXP
+
+    Examples:
+    > custom-output --logfile my.log --append-time --grep 'success|fail' \
+        -- longtime-script arg1 arg2
+    > custom-output --append-hostname --append hoge --append foo \
+        -- my-script.pl arg1 arg2
+
+=head1 AUTHOR
+
+Shoichi Kaji
+
+=cut
